@@ -1,0 +1,992 @@
+PART 2: PROFILE SYSTEM
+2.1 AuthService Profile Methods (auth_service.dart)
+dart
+// ============================================
+// AUTH SERVICE WITH PROFILE MANAGEMENT
+// ============================================
+
+class AuthService extends ChangeNotifier {
+  Map<String, dynamic>? _currentUser;
+  bool get isLoggedIn => _currentUser != null;
+  Map<String, dynamic>? get currentUser => _currentUser;
+
+  // UPDATE PROFILE - Supports both mobile (file path) and web (base64)
+  Future<void> updateProfile({
+    required String displayName,
+    required String bio,
+    required String website,
+    required String location,
+    String? profileImagePath,   // For mobile
+    String? profileImageBase64, // For web
+  }) async {
+    try {
+      if (_currentUser == null) return;
+
+      final users = await getAllUsers();
+      final userIndex = users.indexWhere((u) => u['id'] == _currentUser!['id']);
+      
+      if (userIndex != -1) {
+        // Update text fields
+        users[userIndex]['fullName'] = displayName;
+        users[userIndex]['bio'] = bio;
+        users[userIndex]['website'] = website;
+        users[userIndex]['location'] = location;
+
+        // Save image path for mobile
+        if (profileImagePath != null) {
+          users[userIndex]['profileImagePath'] = profileImagePath;
+        }
+
+        // Save base64 for web
+        if (profileImageBase64 != null) {
+          users[userIndex]['profileImageBase64'] = profileImageBase64;
+        }
+
+        await _saveUsers(users);
+        _currentUser = users[userIndex];
+        await _saveCurrentSession(_currentUser!);
+        notifyListeners();
+      }
+    } catch (e) {
+      print('Error updating profile: $e');
+    }
+  }
+
+  // GET ALL REGISTERED USERS
+  Future<List<Map<String, dynamic>>> getAllUsers() async {
+    final prefs = await SharedPreferences.getInstance();
+    final usersJson = prefs.getString(_usersKey);
+    if (usersJson != null) {
+      return List<Map<String, dynamic>>.from(json.decode(usersJson));
+    }
+    return [];
+  }
+
+  // REGISTER NEW USER WITH DEFAULT PROFILE FIELDS
+  Future<String?> register({
+    required String username,
+    required String email,
+    required String password,
+    String? fullName,
+  }) async {
+    try {
+      final users = await getAllUsers();
+
+      // Check for existing user
+      if (users.any((user) => user['email'] == email)) {
+        return 'Email already exists';
+      }
+      if (users.any((user) => user['username'] == username)) {
+        return 'Username already taken';
+      }
+
+      // Create new user with default profile values
+      final newUser = {
+        'id': DateTime.now().millisecondsSinceEpoch,
+        'username': username,
+        'email': email,
+        'password': password,
+        'fullName': fullName ?? username.replaceFirst('@', ''),
+        'bio': '',           // Empty bio by default
+        'website': '',       // Empty website
+        'location': '',      // Empty location
+        'profileImagePath': null,    // For mobile
+        'profileImageBase64': null,  // For web
+        'createdAt': DateTime.now().toIso8601String(),
+      };
+
+      users.add(newUser);
+      await _saveUsers(users);
+      return null;
+    } catch (e) {
+      return 'An error occurred: $e';
+    }
+  }
+
+  // LOGOUT
+  Future<void> logout() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_currentUserKey);
+      _currentUser = null;
+      notifyListeners();
+    } catch (e) {
+      print('Error logging out: $e');
+    }
+  }
+}
+2.2 EditProfileScreen (edit_profile_screen.dart)
+dart
+// ============================================
+// EDIT PROFILE SCREEN
+// ============================================
+
+class EditProfileScreen extends StatefulWidget {
+  const EditProfileScreen({super.key});
+
+  @override
+  State<EditProfileScreen> createState() => _EditProfileScreenState();
+}
+
+class _EditProfileScreenState extends State<EditProfileScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _displayNameController = TextEditingController();
+  final _bioController = TextEditingController();
+  final _websiteController = TextEditingController();
+  final _locationController = TextEditingController();
+
+  // Image handling - different for mobile and web
+  File? _profileImageFile;           // Mobile
+  String? _profileImageBase64;       // Web
+  Uint8List? _profileImageBytes;     // Web
+
+  final ImagePicker _picker = ImagePicker();
+
+  @override
+  void initState() {
+    super.initState();
+    _loadUserData();
+  }
+
+  // LOAD EXISTING PROFILE DATA
+  void _loadUserData() {
+    final authService = Provider.of<AuthService>(context, listen: false);
+    final user = authService.currentUser;
+
+    _displayNameController.text = user?['fullName'] ?? '';
+    _bioController.text = user?['bio'] ?? '';
+    _websiteController.text = user?['website'] ?? '';
+    _locationController.text = user?['location'] ?? '';
+    
+    _loadSavedImage();
+  }
+
+  // LOAD SAVED PROFILE IMAGE
+  Future<void> _loadSavedImage() async {
+    final authService = Provider.of<AuthService>(context, listen: false);
+    final user = authService.currentUser;
+
+    // For Web: Load base64 image
+    if (kIsWeb) {
+      final imageBase64 = user?['profileImageBase64'];
+      if (imageBase64 != null && imageBase64.isNotEmpty) {
+        try {
+          final bytes = base64.decode(imageBase64);
+          setState(() {
+            _profileImageBytes = bytes;
+            _profileImageBase64 = imageBase64;
+          });
+        } catch (e) {
+          print('Error decoding image: $e');
+        }
+      }
+    }
+    // For Mobile: Load file path
+    else {
+      final imagePath = user?['profileImagePath'];
+      if (imagePath != null && imagePath.isNotEmpty) {
+        try {
+          final file = File(imagePath);
+          if (await file.exists()) {
+            setState(() {
+              _profileImageFile = file;
+            });
+          }
+        } catch (e) {
+          print('Error loading file: $e');
+        }
+      }
+    }
+  }
+
+  // PICK IMAGE FROM GALLERY
+  Future<void> _pickImageFromGallery() async {
+    // For mobile Android, request permission
+    if (!kIsWeb && Theme.of(context).platform == TargetPlatform.android) {
+      bool hasPermission = await _requestPermission(Permission.photos);
+      if (!hasPermission) {
+        _showSnackBar('Storage permission denied', isError: true);
+        return;
+      }
+    }
+
+    try {
+      final XFile? image = await _picker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 500,
+        maxHeight: 500,
+        imageQuality: 85,
+      );
+
+      if (image != null) {
+        await _processPickedImage(image);
+        _showSnackBar('Image selected successfully!');
+      }
+    } catch (e) {
+      print('Error selecting image: $e');
+      _showSnackBar('Error selecting image: $e', isError: true);
+    }
+  }
+
+  // PROCESS PICKED IMAGE (Handle both mobile and web)
+  Future<void> _processPickedImage(XFile image) async {
+    final bytes = await image.readAsBytes();
+
+    setState(() {
+      if (kIsWeb) {
+        _profileImageBytes = bytes;
+        _profileImageBase64 = base64.encode(bytes);
+        _profileImageFile = null;
+      } else {
+        _profileImageFile = File(image.path);
+        _profileImageBytes = null;
+        _profileImageBase64 = null;
+      }
+    });
+  }
+
+  // SAVE PROFILE CHANGES
+  Future<void> _handleSave() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    setState(() => _isLoading = true);
+
+    final authService = Provider.of<AuthService>(context, listen: false);
+
+    // For Web: Save base64
+    if (kIsWeb) {
+      await authService.updateProfile(
+        displayName: _displayNameController.text,
+        bio: _bioController.text,
+        website: _websiteController.text,
+        location: _locationController.text,
+        profileImageBase64: _profileImageBase64,
+        profileImagePath: null,
+      );
+    }
+    // For Mobile: Save file path
+    else {
+      await authService.updateProfile(
+        displayName: _displayNameController.text,
+        bio: _bioController.text,
+        website: _websiteController.text,
+        location: _locationController.text,
+        profileImagePath: _profileImageFile?.path,
+        profileImageBase64: null,
+      );
+    }
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Your profile has been updated!'),
+          backgroundColor: AppColors.spotifyGreen,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      Navigator.pop(context, true);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final authService = Provider.of<AuthService>(context);
+    final user = authService.currentUser;
+    final rawUsername = user?['username'] ?? 'user';
+    final displayUsername = rawUsername.startsWith('@') ? rawUsername : '@$rawUsername';
+
+    bool hasImage = kIsWeb ? _profileImageBytes != null : _profileImageFile != null;
+
+    return Scaffold(
+      backgroundColor: AppColors.background,
+      appBar: AppBar(
+        backgroundColor: AppColors.card,
+        leading: IconButton(
+          icon: const Icon(Icons.close, color: Colors.white),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: const Text('Edit Profile', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        actions: [
+          TextButton(
+            onPressed: _isLoading ? null : _handleSave,
+            child: _isLoading
+                ? const CircularProgressIndicator(strokeWidth: 2, color: AppColors.spotifyGreen)
+                : Text('Save', style: TextStyle(color: AppColors.spotifyGreen, fontSize: 16, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(20),
+        child: Form(
+          key: _formKey,
+          child: Column(
+            children: [
+              // Profile Picture Section
+              Center(
+                child: Stack(
+                  children: [
+                    GestureDetector(
+                      onTap: _showImagePicker,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          border: Border.all(color: AppColors.spotifyGreen, width: 3),
+                        ),
+                        child: CircleAvatar(
+                          radius: 60,
+                          backgroundColor: Colors.pink,
+                          backgroundImage: kIsWeb
+                              ? (_profileImageBytes != null ? MemoryImage(_profileImageBytes!) : null)
+                              : (_profileImageFile != null ? FileImage(_profileImageFile!) : null),
+                          child: !hasImage
+                              ? Text(
+                                  displayUsername.length > 1 ? displayUsername[1].toUpperCase() : 'U',
+                                  style: const TextStyle(color: Colors.white, fontSize: 40, fontWeight: FontWeight.bold),
+                                )
+                              : null,
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      bottom: 0,
+                      right: 0,
+                      child: GestureDetector(
+                        onTap: _showImagePicker,
+                        child: Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: AppColors.spotifyGreen,
+                            shape: BoxShape.circle,
+                            border: Border.all(color: AppColors.background, width: 3),
+                          ),
+                          child: const Icon(Icons.camera_alt, color: Colors.black, size: 20),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 30),
+
+              // Form Fields
+              _buildTextField(
+                controller: _displayNameController,
+                label: 'DISPLAY NAME',
+                icon: Icons.person_outline,
+                hint: 'Enter your display name',
+                required: true,
+              ),
+              const SizedBox(height: 20),
+
+              _buildTextField(
+                controller: _bioController,
+                label: 'BIO',
+                icon: Icons.info_outline,
+                hint: 'Tell us about yourself',
+                maxLines: 3,
+                required: false,  // Bio is optional
+              ),
+              const SizedBox(height: 20),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTextField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+    required String hint,
+    int maxLines = 1,
+    bool required = true,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label + (required ? ' *' : ''), style: TextStyle(color: Colors.grey[400], fontSize: 12, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        TextFormField(
+          controller: controller,
+          style: const TextStyle(color: Colors.white),
+          maxLines: maxLines,
+          decoration: InputDecoration(
+            hintText: hint,
+            hintStyle: const TextStyle(color: Colors.grey),
+            prefixIcon: Icon(icon, color: Colors.grey),
+            filled: true,
+            fillColor: AppColors.card,
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(15),
+              borderSide: BorderSide(color: AppColors.spotifyGreen, width: 2),
+            ),
+          ),
+          validator: (value) {
+            if (required && (value == null || value.isEmpty)) {
+              return 'Please enter your $label';
+            }
+            return null;
+          },
+        ),
+      ],
+    );
+  }
+}
+2.3 ProfileScreen (profile_screen.dart)
+dart
+// ============================================
+// MAIN PROFILE SCREEN
+// ============================================
+
+class ProfileScreen extends StatefulWidget {
+  const ProfileScreen({super.key});
+
+  @override
+  State<ProfileScreen> createState() => _ProfileScreenState();
+}
+
+class _ProfileScreenState extends State<ProfileScreen> with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+  bool _activityStatusEnabled = true;
+  bool _privateAccountEnabled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 3, vsync: this);
+    _loadUserSettings();
+  }
+
+  // Load privacy settings from SharedPreferences
+  Future<void> _loadUserSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) {
+      setState(() {
+        _activityStatusEnabled = prefs.getBool('activity_status') ?? true;
+        _privateAccountEnabled = prefs.getBool('private_account') ?? false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Consumer2<AuthService, FollowService>(
+      builder: (context, authService, followService, child) {
+        final user = authService.currentUser;
+        final String rawUsername = user?['username'] ?? 'spotifyuser';
+        final String displayUsername = rawUsername.startsWith('@') ? rawUsername : '@$rawUsername';
+        final displayName = user?['fullName'] ?? rawUsername.replaceFirst('@', '');
+        final bio = user?['bio'] ?? '';
+
+        // Handle profile image (mobile vs web)
+        final profileImagePath = user?['profileImagePath'];
+        final profileImageBase64 = user?['profileImageBase64'];
+
+        ImageProvider? profileImage;
+        if (profileImageBase64 != null && profileImageBase64.isNotEmpty) {
+          try {
+            final bytes = base64.decode(profileImageBase64);
+            profileImage = MemoryImage(bytes);
+          } catch (e) {
+            debugPrint('Error decoding profile image: $e');
+          }
+        } else if (profileImagePath != null && profileImagePath.isNotEmpty) {
+          try {
+            final file = File(profileImagePath);
+            if (file.existsSync()) {
+              profileImage = FileImage(file);
+            }
+          } catch (e) {
+            debugPrint('Error loading profile image: $e');
+          }
+        }
+
+        return Consumer2<PostProvider, ThreadProvider>(
+          builder: (context, postProvider, threadProvider, child) {
+            // Get user's posts (music + threads)
+            final userMusicPosts = postProvider.posts.where((post) =>
+                post.username == rawUsername || post.username == '@$rawUsername').toList();
+
+            final userThreadPosts = threadProvider.threadPosts.where((thread) =>
+                (thread.username == rawUsername || thread.username == '@$rawUsername') && 
+                !thread.isQuote).toList();
+
+            List<dynamic> allUserPosts = [];
+            allUserPosts.addAll(userMusicPosts);
+            allUserPosts.addAll(userThreadPosts);
+            allUserPosts.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+
+            // Get liked posts (music + threads)
+            List<dynamic> allLikedPosts = [];
+            allLikedPosts.addAll(postProvider.userLikedPosts);
+            allLikedPosts.addAll(threadProvider.userLikedThreads);
+            allLikedPosts.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+
+            // Get reposted posts + quoted threads
+            List<dynamic> allRepostedPosts = [];
+            allRepostedPosts.addAll(postProvider.userReposts);
+            allRepostedPosts.addAll(threadProvider.userRepostedThreads);
+            
+            final userQuotedThreads = threadProvider.threadPosts.where((thread) =>
+                (thread.username == rawUsername || thread.username == '@$rawUsername') && 
+                thread.isQuote).toList();
+            
+            allRepostedPosts.addAll(userQuotedThreads);
+            allRepostedPosts.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+
+            return Scaffold(
+              backgroundColor: AppColors.background,
+              body: NestedScrollView(
+                headerSliverBuilder: (context, innerBoxIsScrolled) {
+                  return [
+                    SliverAppBar(
+                      expandedHeight: 320,
+                      floating: false,
+                      pinned: true,
+                      backgroundColor: AppColors.card,
+                      flexibleSpace: FlexibleSpaceBar(
+                        background: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            // Background Gradient
+                            Container(
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topCenter,
+                                  end: Alignment.bottomCenter,
+                                  colors: [AppColors.spotifyGreen, AppColors.background],
+                                ),
+                              ),
+                            ),
+                            // Profile Info Overlay
+                            Positioned(
+                              bottom: 20,
+                              left: 20,
+                              right: 20,
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  // Profile Picture with Activity Status
+                                  GestureDetector(
+                                    onTap: () {
+                                      _showProfilePicturePreview(profileImage, 
+                                          displayName.isNotEmpty ? displayName[0].toUpperCase() : 'U', 
+                                          displayUsername);
+                                    },
+                                    child: Hero(
+                                      tag: 'profile-pic-$displayUsername',
+                                      child: Stack(
+                                        children: [
+                                          CircleAvatar(
+                                            radius: 40,
+                                            backgroundColor: Colors.pink,
+                                            backgroundImage: profileImage,
+                                            child: profileImage == null
+                                                ? Text(
+                                                    displayName.isNotEmpty ? displayName[0].toUpperCase() : 'U',
+                                                    style: const TextStyle(color: Colors.white, fontSize: 30),
+                                                  )
+                                                : null,
+                                          ),
+                                          if (_activityStatusEnabled)
+                                            Positioned(
+                                              bottom: 2,
+                                              right: 2,
+                                              child: Container(
+                                                width: 16,
+                                                height: 16,
+                                                decoration: BoxDecoration(
+                                                  color: AppColors.spotifyGreen,
+                                                  shape: BoxShape.circle,
+                                                  border: Border.all(color: AppColors.background, width: 2),
+                                                ),
+                                              ),
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(height: 12),
+                                  Row(
+                                    children: [
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            Row(
+                                              children: [
+                                                Text(
+                                                  displayName,
+                                                  style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold),
+                                                ),
+                                                if (_privateAccountEnabled) ...[
+                                                  const SizedBox(width: 8),
+                                                  Container(
+                                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                                    decoration: BoxDecoration(
+                                                      color: Colors.grey[800],
+                                                      borderRadius: BorderRadius.circular(12),
+                                                    ),
+                                                    child: Row(
+                                                      children: const [
+                                                        Icon(Icons.lock, color: Colors.grey, size: 12),
+                                                        SizedBox(width: 3),
+                                                        Text('Private', style: TextStyle(color: Colors.grey, fontSize: 10)),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                ],
+                                              ],
+                                            ),
+                                            Text(
+                                              displayUsername,
+                                              style: TextStyle(color: Colors.white.withValues(alpha: 0.8), fontSize: 16),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      // Edit Profile Button
+                                      GestureDetector(
+                                        onTap: () async {
+                                          final result = await Navigator.push(
+                                            context,
+                                            MaterialPageRoute(builder: (context) => const EditProfileScreen()),
+                                          );
+                                          if (result == true && mounted) {
+                                            await authService.loadSavedSession();
+                                          }
+                                        },
+                                        child: Container(
+                                          padding: const EdgeInsets.all(10),
+                                          decoration: BoxDecoration(
+                                            color: Colors.white.withValues(alpha: 0.2),
+                                            borderRadius: BorderRadius.circular(20),
+                                          ),
+                                          child: const Icon(Icons.edit, color: Colors.white, size: 20),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      // Settings Menu Button
+                                      GestureDetector(
+                                        onTap: _showSettingsMenu,
+                                        child: Container(
+                                          padding: const EdgeInsets.all(10),
+                                          decoration: BoxDecoration(
+                                            color: Colors.white.withValues(alpha: 0.2),
+                                            borderRadius: BorderRadius.circular(20),
+                                          ),
+                                          child: const Icon(Icons.more_horiz, color: Colors.white, size: 20),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    // Stats Section (Posts, Followers, Following)
+                    SliverToBoxAdapter(
+                      child: Container(
+                        color: AppColors.background,
+                        padding: const EdgeInsets.all(20),
+                        child: Column(
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceAround,
+                              children: [
+                                _buildStatColumn(
+                                  '${allUserPosts.length}',
+                                  'Posts',
+                                  Icons.music_note,
+                                  onTap: () => _tabController.animateTo(0),
+                                ),
+                                Container(height: 40, width: 1, color: Colors.grey[800]),
+                                _buildStatColumn(
+                                  '${followService.followersCount}',
+                                  'Followers',
+                                  Icons.people_outline,
+                                  onTap: _showFollowersList,
+                                ),
+                                Container(height: 40, width: 1, color: Colors.grey[800]),
+                                _buildStatColumn(
+                                  '${followService.followingCount}',
+                                  'Following',
+                                  Icons.person_outline,
+                                  onTap: _showFollowingList,
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 24),
+                            // Bio Section
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.all(16),
+                              decoration: BoxDecoration(
+                                color: AppColors.card,
+                                borderRadius: BorderRadius.circular(15),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Icon(Icons.info_outline, color: AppColors.spotifyGreen, size: 18),
+                                      const SizedBox(width: 8),
+                                      const Text('Bio', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Text(bio.isEmpty ? 'No bio yet' : bio, style: const TextStyle(color: Colors.grey)),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    // Tab Bar
+                    SliverPersistentHeader(
+                      delegate: _SliverAppBarDelegate(
+                        TabBar(
+                          controller: _tabController,
+                          indicatorColor: AppColors.spotifyGreen,
+                          indicatorWeight: 3,
+                          labelColor: AppColors.spotifyGreen,
+                          unselectedLabelColor: Colors.grey,
+                          tabs: const [
+                            Tab(text: 'POSTS'),
+                            Tab(text: 'LIKES'),
+                            Tab(text: 'REPOSTS'),
+                          ],
+                        ),
+                      ),
+                      pinned: true,
+                    ),
+                  ];
+                },
+                body: TabBarView(
+                  controller: _tabController,
+                  children: [
+                    _buildGenericPostsTab(allUserPosts, 'No posts yet', 'Create your first post by tapping the + button'),
+                    _buildLikedContentTab(allLikedPosts),
+                    _buildGenericPostsTab(allRepostedPosts, 'No reposts', 'Repost content to share with your followers'),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // STAT COLUMN WIDGET
+  Widget _buildStatColumn(String value, String label, IconData icon, {required VoidCallback onTap}) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(color: AppColors.spotifyGreen.withValues(alpha: 0.1), shape: BoxShape.circle),
+            child: Icon(icon, color: AppColors.spotifyGreen, size: 20),
+          ),
+          const SizedBox(height: 8),
+          Text(value, style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)),
+          Text(label, style: TextStyle(color: Colors.grey[400], fontSize: 12)),
+        ],
+      ),
+    );
+  }
+
+  // LIKED CONTENT TAB (shows both music and thread posts)
+  Widget _buildLikedContentTab(List<dynamic> likedPosts) {
+    if (likedPosts.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.favorite_border, size: 80, color: Colors.grey[800]),
+            const SizedBox(height: 16),
+            Text('No liked posts', style: TextStyle(color: Colors.grey[400], fontSize: 20, fontWeight: FontWeight.bold)),
+            Text('Tap the heart icon on posts you love', style: TextStyle(color: Colors.grey[600])),
+          ],
+        ),
+      );
+    }
+
+    return ListView.builder(
+      padding: const EdgeInsets.all(16),
+      itemCount: likedPosts.length,
+      itemBuilder: (context, index) {
+        final post = likedPosts[index];
+        if (post is PostModel) {
+          return _buildMusicPostCard(post);
+        } else if (post is ThreadPost) {
+          return Padding(padding: const EdgeInsets.only(bottom: 12), child: ThreadCard(post: post));
+        }
+        return const SizedBox.shrink();
+      },
+    );
+  }
+
+  // SHOW FOLLOWERS LIST
+  Future<void> _showFollowersList() async {
+    final followService = Provider.of<FollowService>(context, listen: false);
+    final List<Map<String, dynamic>> followers = [];
+    for (String userId in followService.followersList) {
+      final details = await followService.getUserDetails(userId);
+      followers.add(details);
+    }
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => FollowListScreen(
+          title: 'Followers',
+          users: followers,
+          onFollowTap: (user) async {
+            if (user['isFollowing']) {
+              await followService.followUser(user['id'].toString());
+            } else {
+              await followService.unfollowUser(user['id'].toString());
+            }
+          },
+        ),
+      ),
+    );
+  }
+
+  // SHOW FOLLOWING LIST
+  Future<void> _showFollowingList() async {
+    final followService = Provider.of<FollowService>(context, listen: false);
+    final List<Map<String, dynamic>> following = [];
+    for (String userId in followService.followingList) {
+      final details = await followService.getUserDetails(userId);
+      following.add(details);
+    }
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => FollowListScreen(
+          title: 'Following',
+          users: following,
+          onFollowTap: (user) async {
+            if (user['isFollowing']) {
+              await followService.followUser(user['id'].toString());
+            } else {
+              await followService.unfollowUser(user['id'].toString());
+            }
+          },
+        ),
+      ),
+    );
+  }
+
+  // SHOW SETTINGS MENU (Bottom Sheet)
+  void _showSettingsMenu() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (BuildContext context) {
+        return Container(
+          decoration: BoxDecoration(
+            color: AppColors.card,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(30)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                margin: const EdgeInsets.symmetric(vertical: 12),
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(color: Colors.grey[600], borderRadius: BorderRadius.circular(2)),
+              ),
+              ListTile(
+                leading: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(color: AppColors.spotifyGreen.withValues(alpha: 0.1), shape: BoxShape.circle),
+                  child: Icon(Icons.settings, color: AppColors.spotifyGreen),
+                ),
+                title: const Text('Settings', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                subtitle: const Text('App preferences and account settings', style: TextStyle(color: Colors.grey)),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.push(context, MaterialPageRoute(builder: (context) => const SettingsScreen()));
+                },
+              ),
+              ListTile(
+                leading: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(color: Colors.red.withValues(alpha: 0.1), shape: BoxShape.circle),
+                  child: const Icon(Icons.logout, color: Colors.red),
+                ),
+                title: const Text('Logout', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                subtitle: const Text('Sign out of your account', style: TextStyle(color: Colors.grey)),
+                onTap: () {
+                  Navigator.pop(context);
+                  _handleLogout();
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // HANDLE LOGOUT
+  Future<void> _handleLogout() async {
+    final authService = Provider.of<AuthService>(context, listen: false);
+    final bool? confirm = await showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.card,
+        title: const Text('Logout', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        content: const Text('Are you sure you want to logout?', style: TextStyle(color: Colors.grey)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: Text('Cancel', style: TextStyle(color: Colors.grey[400]))),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Logout'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true && mounted) {
+      await authService.logout();
+      if (mounted) {
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(builder: (_) => const LoginScreen()),
+          (route) => false,
+        );
+      }
+    }
+  }
+}
+
+// Tab Bar Delegate for sticky tab bar
+class _SliverAppBarDelegate extends SliverPersistentHeaderDelegate {
+  final TabBar _tabBar;
+  _SliverAppBarDelegate(this._tabBar);
+
+  @override
+  double get minExtent => _tabBar.preferredSize.height;
+  @override
+  double get maxExtent => _tabBar.preferredSize.height;
+
+  @override
+  Widget build(BuildContext context, double shrinkOffset, bool overlapsContent) {
+    return Container(color: AppColors.background, child: _tabBar);
+  }
+
+  @override
+  bool shouldRebuild(_SliverAppBarDelegate oldDelegate) => false;
+}
